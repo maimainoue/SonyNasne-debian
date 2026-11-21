@@ -923,10 +923,11 @@ static void send_headers(int sock) {
 
 /* 1回の選局+受信セッション。http>0 のとき out_fd がソケットで、準備できた時点でHTTPヘッダを送る。戻り値は終了コード */
 static int si_only;		/* HTTP の ?si=1: SI(PAT/NIT/SDT/EIT/TOT 等)だけを出す。B-CAS の ACTIVATE も復号ストリームも使わない(番組表の取得用。視聴中の別系統に影響しない) */
+static int no_bcas;		/* HTTP の ?bcas=0 / CLI の --no-bcas: B-CAS を見ず(ACTIVATE も復号ストリームも使わない)、PSI ストリームの全 PID を復号せずそのまま出す(生の TS。--sid/?sid= は無視) */
 static int session(int is_sat, unsigned long freq_val, unsigned long ts_id, unsigned long want_sid, unsigned long dur_ms, int ofd, int http) {
     int rc, sel; struct svc *s; unsigned long t_start, nto = 0;
     out_fd = ofd; olen = 0; stop_flag = 0; term_flag = 0; prev_pt = prev_sec = 0xff; h_pt0 = h_pt1 = h_sec0 = h_sec1 = h_g0 = h_g1 = 0;
-    session_want_sid = si_only ? 0 : want_sid;      /* si_only のときは、PSI ストリームの元の PAT も通す */
+    session_want_sid = (si_only || no_bcas) ? 0 : want_sid;      /* si_only / no_bcas のときは、PSI ストリームの元の PAT も通す */
     lgx("session start freq", freq_val);
     if (is_sat) lgx("session ts_id", ts_id);
     rc = acquire_tuner(is_sat);
@@ -946,18 +947,18 @@ static int session(int is_sat, unsigned long freq_val, unsigned long ts_id, unsi
     if (ioc(ob_pt, 0x484, 0x2d, 2000) != 1) { err("PSIストリームを開けない\n"); if (http) http_status(ofd, "HTTP/1.0 500 Internal Server Error", "psi stream\n"); release_tuner(); return 1; }
     h_pt0 = ob_pt[0xa4 / 4]; h_pt1 = ob_pt[0xa8 / 4];
     lgx("psi stream opened", h_pt0);
-    if (si_only) {      /* SI だけの配信(番組表の取得用)。discover も B-CAS も復号ストリームも使わない */
+    if (si_only || no_bcas) {      /* SI だけの配信(番組表の取得用)、または生の TS の配信(no_bcas)。discover も B-CAS も復号ストリームも使わない */
         unsigned long nt = 0;
         if (http) send_headers(ofd);
         t_start = now_ms();
-        lgx("si-only streaming begin", 0);
+        lgx(si_only ? "si-only streaming begin" : "raw (no-bcas) streaming begin", 0);
         while (!stop_flag) {
             unsigned char *p; unsigned long psz, k;
             if (dur_ms && now_ms() - t_start >= dur_ms) break;
             if (recv_pt(200, &p, &psz)) {
                 nt = 0;
                 for (k = 0; k + 188 <= psz; k += 188)
-                    if (p[k] == 0x47 && is_si_pid(((p[k + 1] & 0x1f) << 8) | p[k + 2])) put_pkt(p + k);
+                    if (p[k] == 0x47 && (!si_only || is_si_pid(((p[k + 1] & 0x1f) << 8) | p[k + 2]))) put_pkt(p + k);
             } else if (++nt > 100) { err("出力が止まった\n"); break; }
             if (olen) flush_out();
         }
@@ -1451,6 +1452,7 @@ static int listen_port(unsigned long port) {
                         else while (*p >= '0' && *p <= '9') { ts_id = ts_id * 10 + (*p - '0'); p++; }
                     } else if (starts(p, "sec=")) { p += 4; while (*p >= '0' && *p <= '9') { sec = sec * 10 + (*p - '0'); p++; } }
                     else if (starts(p, "si=")) { p += 3; si_only = (*p == '1'); while (*p >= '0' && *p <= '9') p++; }
+                    else if (starts(p, "bcas=")) { p += 5; no_bcas = (*p == '0'); while (*p >= '0' && *p <= '9') p++; }
                     else break;
                 }
                 if (!parse_channel_str(ch_buf, &is_sat, &freq_val, &parsed_ts_id)) {
@@ -1484,6 +1486,7 @@ int main_c(long *sp) {
         else if (streq(a, "--scan-sat")) do_scan = 2;
         else if (streq(a, "--scan-all")) do_scan = 3;
         else if (streq(a, "-v")) verbose = 1;
+        else if (streq(a, "--no-bcas")) no_bcas = 1;           /* B-CAS を見ず、復号しない生の TS を出す */
         else if (streq(a, "--dual-tuner")) dual_mode = 1;       /* 地デジと衛星を同時に使う(試験的)。既定は従来どおり1系統 */
         else if (streq(a, "--device") || streq(a, "--lnb") || streq(a, "--udp") || streq(a, "--port") || streq(a, "--http")) ai++;
         else if (a[0] == '-' && a[1] == '-') { /* --b25 --strip 等の recpt1 オプションは無視 */ }
@@ -1492,7 +1495,7 @@ int main_c(long *sp) {
     if (port) { logv = 1; return listen_port(port); }        /* 待ち受け(親)は既定のシグナル動作のまま。各子プロセスがハンドラを設定する */
     set_sig(SIGINT_); set_sig(SIGTERM_); set_sig(SIGPIPE_);
     if (do_scan) return scan(1, do_scan == 2 ? 1 : do_scan == 3 ? 2 : 0);
-    if (npos < 3 - (freq_hz ? 1 : 0)) { err("usage: nasne-recpt1 [--sid N] [--tsid N] [-v] [--dual-tuner] <ch 13-62 | BS1-BS23(奇数。BS15_0 のようにスロット付きも可) | CS2-CS24(偶数) | --freq MHz> <秒数|-> <出力|->\n       nasne-recpt1 --scan [--scan-sat | --scan-all] | --listen <port>\n"); return 2; }
+    if (npos < 3 - (freq_hz ? 1 : 0)) { err("usage: nasne-recpt1 [--sid N] [--tsid N] [-v] [--dual-tuner] [--no-bcas] <ch 13-62 | BS1-BS23(奇数。BS15_0 のようにスロット付きも可) | CS2-CS24(偶数) | --freq MHz> <秒数|-> <出力|->\n       nasne-recpt1 --scan [--scan-sat | --scan-all] | --listen <port>\n"); return 2; }
     {
         const char *chs, *secs, *dst;
         int is_sat = 0; unsigned long freq_val = 0, parsed_tsid = 0;
